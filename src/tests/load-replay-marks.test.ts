@@ -238,4 +238,96 @@ describe("LoadReplays", () => {
     await replays.send("s", record("later"));
     expect(sent.at(-1)).toBe("later");
   });
+
+  it("queues the messages of a child session of the replaying session", async () => {
+    const sent: string[] = [];
+    const replays = new LoadReplays<Note>(async (notification) => {
+      sent.push(notification.name);
+    });
+    const record = (name: string) => async () => {
+      sent.push(name);
+    };
+    const replay = replays.start("s", (sessionId) => sessionId === "child")!;
+    await replay.sessionUpdate(note("a"));
+
+    const parent = replays.send("s", record("parent tool_call"));
+    const child = replays.send("child", record("child update"));
+    const request = replays.send("child", async () => {
+      sent.push("child request");
+      return "allow";
+    });
+    await replays.send("stranger", record("stranger"));
+    expect(sent).toEqual(["stranger"]);
+
+    await replay.finish(true);
+    await expect(request).resolves.toBe("allow");
+    await Promise.all([parent, child]);
+    expect(sent).toEqual(["stranger", "a", "parent tool_call", "child update", "child request"]);
+  });
+
+  it("forgets a URL elicitation that settles without accept", async () => {
+    const sent: string[] = [];
+    const replays = new LoadReplays<Note>(async (notification) => {
+      sent.push(notification.name);
+    });
+    const respond = (action: string) => async () => {
+      sent.push(`create ${action}`);
+      return { action };
+    };
+    const replay = replays.start("s")!;
+    await replay.sessionUpdate(note("a"));
+    const declined = replays.createElicitation(
+      { sessionId: "s", elicitationId: "declined" },
+      respond("decline"),
+    );
+    const failed = replays.createElicitation({ sessionId: "s", elicitationId: "failed" }, () =>
+      Promise.reject(new Error("lost")),
+    );
+    const accepted = replays.createElicitation(
+      { sessionId: "s", elicitationId: "accepted" },
+      respond("accept"),
+    );
+    await replay.finish(true);
+    await expect(declined).resolves.toEqual({ action: "decline" });
+    await expect(failed).rejects.toThrow("lost");
+    await expect(accepted).resolves.toEqual({ action: "accept" });
+
+    // While a new replay holds an update, only the completion of the accepted
+    // elicitation still knows its session and waits in the queue.
+    const before = sent.length;
+    const again = replays.start("s")!;
+    await again.sessionUpdate(note("b"));
+    await replays.completeElicitation("declined", async () => void sent.push("complete declined"));
+    await replays.completeElicitation("failed", async () => void sent.push("complete failed"));
+    const completed = replays.completeElicitation(
+      "accepted",
+      async () => void sent.push("complete accepted"),
+    );
+    expect(sent.slice(before)).toEqual(["complete declined", "complete failed"]);
+    await again.finish(true);
+    await completed;
+    expect(sent.slice(before)).toEqual([
+      "complete declined",
+      "complete failed",
+      "b",
+      "complete accepted",
+    ]);
+  });
+
+  it("does not record a URL elicitation when no replay of its session runs", async () => {
+    const sent: string[] = [];
+    const replays = new LoadReplays<Note>(async (notification) => {
+      sent.push(notification.name);
+    });
+    await replays.createElicitation({ sessionId: "s", elicitationId: "e1" }, async () => {
+      sent.push("create e1");
+      return { action: "accept" };
+    });
+    const replay = replays.start("s")!;
+    await replay.sessionUpdate(note("a"));
+    // The completion does not know the session, so it does not wait.
+    await replays.completeElicitation("e1", async () => void sent.push("complete e1"));
+    expect(sent).toEqual(["create e1", "complete e1"]);
+    await replay.finish(true);
+  });
 });

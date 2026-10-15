@@ -971,6 +971,19 @@ export class NativeSubagentRuntime {
 }
 
 /**
+ * Tells if `sessionId` is the ACP session of a native subagent of `session`,
+ * at any depth. The registry keeps the latest generation of each child, nested
+ * ones too, until the session clears it. An earlier generation has finished,
+ * so it sends no more messages.
+ */
+export function isNativeChildSession(session: NativeSubagentSession, sessionId: string): boolean {
+  for (const child of session.nativeSubagentsByTaskId?.values() ?? []) {
+    if (child.sessionId === sessionId) return true;
+  }
+  return false;
+}
+
+/**
  * Announces the child on its parent, once, before any update of the child.
  * The RFD form announces it as running and then sends the prompt as the
  * first message of the child. It grants the child `cancel`: the client may

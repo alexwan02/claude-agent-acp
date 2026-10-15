@@ -153,22 +153,36 @@ export class LoadReplayMarker<N extends ReplayNotification> {
 /**
  * The replay markers of one connection, by session id. Every outbound message
  * of a session goes through {@link send}, so it waits behind the held
- * notification of a replay of that session. When the session does not
- * replay, {@link send} sends at once.
+ * notification of a replay of that session. A message of a subagent child
+ * session of the replaying session waits in the same queue, so the messages of
+ * the whole session tree keep the call order. When no session of the tree
+ * replays, {@link send} sends at once.
  */
 export class LoadReplays<N extends ReplayNotification> {
-  private readonly markers = new Map<string, LoadReplayMarker<N>>();
-  /** The session of each open URL elicitation. The completion notification
-   *  names only the elicitation. */
+  private readonly markers = new Map<string, Replaying<N>>();
+  /**
+   * The session of each URL elicitation that went to the queue of a replay.
+   * The completion notification names only the elicitation. The entry goes
+   * when the completion comes, or when the request settles without accept,
+   * because then no completion comes.
+   */
   private readonly elicitations = new Map<string, string>();
 
   constructor(private readonly deliver: (notification: N) => Promise<void>) {}
 
-  /** The marked replay of `sessionId`, or `undefined` when that session already replays. */
-  start(sessionId: string): LoadReplay<N> | undefined {
+  /**
+   * The marked replay of `sessionId`, or `undefined` when that session already
+   * replays. `isChild` tells if a session is a subagent child session of
+   * `sessionId`, at any depth. A live message of such a child, such as an
+   * update or a permission request, then waits in the queue of `sessionId`.
+   */
+  start(
+    sessionId: string,
+    isChild: (sessionId: string) => boolean = () => false,
+  ): LoadReplay<N> | undefined {
     if (this.markers.has(sessionId)) return undefined;
     const marker = new LoadReplayMarker<N>(sessionId, this.deliver);
-    this.markers.set(sessionId, marker);
+    this.markers.set(sessionId, { marker, isChild });
     return {
       sessionUpdate: (notification) => marker.replayed(notification),
       finish: (complete) => {
@@ -180,7 +194,7 @@ export class LoadReplays<N extends ReplayNotification> {
 
   /** Runs `send`, which sends one message of `sessionId`, in the queue of that session. */
   send<T>(sessionId: unknown, send: () => Promise<T>): Promise<T> {
-    const marker = typeof sessionId === "string" ? this.markers.get(sessionId) : undefined;
+    const marker = this.marker(sessionId);
     return marker ? marker.other(send) : call(send);
   }
 
@@ -189,10 +203,17 @@ export class LoadReplays<N extends ReplayNotification> {
     // A request names a session, or the request that it belongs to. Only a
     // URL request names an elicitation id.
     const { sessionId, elicitationId } = params as { sessionId?: unknown; elicitationId?: unknown };
+    const marker = this.marker(sessionId);
+    if (!marker) return call(send);
+    const sent = marker.other(send);
     if (typeof sessionId === "string" && typeof elicitationId === "string") {
       this.elicitations.set(elicitationId, sessionId);
+      const forget = () => void this.elicitations.delete(elicitationId);
+      sent.then((response) => {
+        if ((response as { action?: unknown } | undefined)?.action !== "accept") forget();
+      }, forget);
     }
-    return this.send(sessionId, send);
+    return sent;
   }
 
   /** Runs `send`, which completes an elicitation, in the queue of the session of its request. */
@@ -201,7 +222,24 @@ export class LoadReplays<N extends ReplayNotification> {
     this.elicitations.delete(elicitationId);
     return this.send(sessionId, send);
   }
+
+  /** The marker of the replay of `sessionId`, or of the replay whose child `sessionId` is. */
+  private marker(sessionId: unknown): LoadReplayMarker<N> | undefined {
+    if (typeof sessionId !== "string" || this.markers.size === 0) return undefined;
+    const own = this.markers.get(sessionId);
+    if (own) return own.marker;
+    for (const replaying of this.markers.values()) {
+      if (replaying.isChild(sessionId)) return replaying.marker;
+    }
+    return undefined;
+  }
 }
+
+/** A replay in progress: its marker, and the test for the child sessions of its session. */
+type Replaying<N extends ReplayNotification> = {
+  marker: LoadReplayMarker<N>;
+  isChild: (sessionId: string) => boolean;
+};
 
 /** The promise of `send`, or a rejected promise when `send` throws. */
 function call<T>(send: () => Promise<T>): Promise<T> {

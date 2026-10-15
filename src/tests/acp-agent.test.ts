@@ -3546,6 +3546,99 @@ describe("load replay queue", () => {
       "s agent_message_chunk 0",
     ]);
   });
+
+  type Replayer = { replaySessionHistory(sessionId: string): Promise<void> };
+
+  const userMessage = (uuid: string, text: string) => ({
+    type: "user",
+    uuid,
+    session_id: "s",
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+    message: { role: "user", content: [{ type: "text", text }] },
+  });
+
+  it("sends the live messages of a subagent child session after the held update and the parent's queued tool call", async () => {
+    const sent: string[] = [];
+    const live: Promise<unknown>[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          sent.push(`${notification.sessionId} ${label(notification)}`);
+          if (live.length > 0) return;
+          // The replay holds its next update now. Meanwhile a running turn of
+          // the session announces a subagent, and the subagent works and asks
+          // for a permission on its own child session.
+          await Promise.resolve();
+          const client = (agent as unknown as { client: AcpClient }).client;
+          live.push(
+            client.sessionUpdate(toolCall),
+            client.sessionUpdate({ ...chunk("child work"), sessionId: "child" }),
+            client.requestPermission({ ...permissionRequest, sessionId: "child" }),
+          );
+        },
+        requestPermission: async (params: { sessionId: string }) => {
+          sent.push(`${params.sessionId} request_permission`);
+          return { outcome: { outcome: "cancelled" } };
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, AIR_CLIENT);
+    agent.sessions.s = mockSessionState({
+      nativeSubagentsByTaskId: new Map([
+        ["task-1", { sessionId: "child", parentSessionId: "s", name: "Explore", task: "look" }],
+      ]),
+    });
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      userMessage("u1", "first"),
+      userMessage("u2", "second"),
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (agent as unknown as Replayer).replaySessionHistory("s");
+    await Promise.all(live);
+
+    expect(sent).toEqual([
+      "s user_message_chunk 0",
+      "s user_message_chunk 1",
+      "s tool_call live",
+      "child agent_message_chunk live",
+      "child request_permission",
+    ]);
+  });
+
+  it("reports the replay error when the finish of the failed replay fails too", async () => {
+    const errors: unknown[][] = [];
+    let finishes = 0;
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async () => {},
+        loadReplay: () => ({
+          sessionUpdate: async () => {},
+          finish: async () => {
+            finishes++;
+            throw new Error("finish lost");
+          },
+        }),
+      } as unknown as AcpClient,
+      { log: () => {}, error: (...args: unknown[]) => errors.push(args) },
+    );
+    await initializeClient(agent, AIR_CLIENT);
+    agent.sessions.s = mockSessionState();
+
+    vi.mocked(getSessionMessages).mockRejectedValueOnce(new Error("history unreadable"));
+    await expect((agent as unknown as Replayer).replaySessionHistory("s")).rejects.toThrow(
+      "history unreadable",
+    );
+    expect(finishes).toBe(1);
+    expect(errors.flat().map(String).join(" ")).toContain("finish lost");
+
+    // A replay that succeeds gets the finish error.
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([]);
+    await expect((agent as unknown as Replayer).replaySessionHistory("s")).rejects.toThrow(
+      "finish lost",
+    );
+  });
 });
 
 describe("session/list", () => {

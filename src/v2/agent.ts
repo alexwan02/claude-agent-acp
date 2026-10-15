@@ -243,8 +243,11 @@ class V2ClientConnection implements AcpClient {
    * updates of the agent, because one v1 update can become several v2 updates,
    * such as a message clear and its first chunk.
    */
-  loadReplay(sessionId: string): LoadReplay<AcpSessionNotification> {
-    const replay = this.replayMarkers.start(sessionId);
+  loadReplay(
+    sessionId: string,
+    isChild?: (sessionId: string) => boolean,
+  ): LoadReplay<AcpSessionNotification> {
+    const replay = this.replayMarkers.start(sessionId, isChild);
     if (!replay) return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
     return {
       sessionUpdate: async (notification) => {

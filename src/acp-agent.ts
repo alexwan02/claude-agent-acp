@@ -115,6 +115,7 @@ import {
   type SubagentState,
 } from "./acp-subagents.js";
 import {
+  isNativeChildSession,
   isNativeSubagentControlTool,
   isNativeSubagentControlUpdate,
   NativeSubagent,
@@ -2331,8 +2332,15 @@ export interface AcpClient {
    * The sender of the history replay of `sessionId` on `session/load`. It
    * marks the replayed updates (see `load-replay-marks.ts`). Without it, the
    * replay sends its updates with {@link sessionUpdate}, unmarked.
+   *
+   * `isChild` tells if a session is a subagent child session of `sessionId`.
+   * While the replay holds an update, the live messages of such a child wait
+   * behind it, as the messages of `sessionId` do.
    */
-  loadReplay?(sessionId: string): LoadReplay<AcpSessionNotification>;
+  loadReplay?(
+    sessionId: string,
+    isChild?: (sessionId: string) => boolean,
+  ): LoadReplay<AcpSessionNotification>;
 }
 
 /**
@@ -2420,12 +2428,15 @@ class ChangedMetaClient implements AcpClient {
    * {@link ChangedMetaFilter}, because the filter can drop an update, and a
    * dropped update must not take an index or the end mark.
    */
-  loadReplay(sessionId: string): LoadReplay<AcpSessionNotification> {
+  loadReplay(
+    sessionId: string,
+    isChild?: (sessionId: string) => boolean,
+  ): LoadReplay<AcpSessionNotification> {
     // The v2 connection marks the v2 updates itself, because one v1 update can
     // become several v2 updates. A second replay of a session that already
     // replays gets no marks.
     const inner = this.airClient()
-      ? (this.inner.loadReplay?.(sessionId) ?? this.replays.start(sessionId))
+      ? (this.inner.loadReplay?.(sessionId, isChild) ?? this.replays.start(sessionId, isChild))
       : undefined;
     if (!inner) return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
     return {
@@ -8872,16 +8883,28 @@ export class ClaudeAcpAgent {
     resumedMessages?: SessionMessage[],
     pending?: PendingReplay,
   ): Promise<void> {
+    // A live subagent of a session that is already open sends its updates and
+    // permission requests to its own child session. The session record can
+    // come after the replay starts, so the test reads it at each call.
+    const isChild = (childSessionId: string) =>
+      isNativeChildSession(this.sessions[sessionId] ?? {}, childSessionId);
     const replay =
-      this.client.loadReplay?.(sessionId) ??
+      this.client.loadReplay?.(sessionId, isChild) ??
       unmarkedLoadReplay((notification) => this.client.sessionUpdate(notification));
-    let complete = false;
     try {
       await this.sendSessionHistory(sessionId, replay, resumedMessages, pending);
-      complete = !pending?.stopped;
-    } finally {
-      await replay.finish(complete);
+    } catch (error) {
+      // The replay error is the cause. A delivery error of the finish must not
+      // hide it.
+      await replay.finish(false).catch((finishError: unknown) => {
+        this.logger.error(
+          `Session ${sessionId}: failed to send the rest of a failed history replay:`,
+          finishError,
+        );
+      });
+      throw error;
     }
+    await replay.finish(!pending?.stopped);
   }
 
   private async sendSessionHistory(
