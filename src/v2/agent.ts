@@ -16,6 +16,7 @@ import type {
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
+import { type LoadReplay, LoadReplayMarker, unmarkedLoadReplay } from "../load-replay-marks.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
@@ -157,6 +158,12 @@ class V2ClientConnection implements AcpClient {
    */
   private readonly replays = new Map<string, Set<string>>();
 
+  /** The replay marker of each session whose marked history replays (see {@link loadReplay}). */
+  private readonly replayMarkers = new Map<
+    string,
+    LoadReplayMarker<v2.UpdateSessionNotification>
+  >();
+
   /** The session whose replay announced each replaying subagent. */
   private readonly replayRoots = new Map<string, string>();
 
@@ -215,7 +222,54 @@ class V2ClientConnection implements AcpClient {
     return this.ctx.notify(method, params);
   }
 
-  async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
+  async sessionUpdate(notification: AcpSessionNotification): Promise<void> {
+    // A live update of a session whose replay holds an update waits behind it.
+    await Promise.all(
+      this.v2Notifications(notification).map((v2Notification) => {
+        const marker = this.replayMarkers.get(v2Notification.sessionId);
+        return marker ? marker.other(v2Notification) : this.notify(v2Notification);
+      }),
+    );
+  }
+
+  /**
+   * Marks the replayed v2 updates of `sessionId` for an AIR client (see
+   * `load-replay-marks.ts`). The marks go on the v2 updates, not on the v1
+   * updates of the agent, because one v1 update can become several v2 updates,
+   * such as a message clear and its first chunk.
+   */
+  loadReplay(sessionId: string): LoadReplay<AcpSessionNotification> {
+    if (this.replayMarkers.has(sessionId)) {
+      return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
+    }
+    const marker = new LoadReplayMarker<v2.UpdateSessionNotification>(sessionId, (notification) =>
+      this.notify(notification),
+    );
+    this.replayMarkers.set(sessionId, marker);
+    return {
+      sessionUpdate: async (notification) => {
+        await Promise.all(
+          this.v2Notifications(notification).map((v2Notification) =>
+            marker.replayed(v2Notification),
+          ),
+        );
+      },
+      finish: (complete) => {
+        this.replayMarkers.delete(sessionId);
+        return marker.finish(complete);
+      },
+    };
+  }
+
+  private notify(notification: v2.UpdateSessionNotification): Promise<void> {
+    return this.ctx.notify(v2.methods.client.session.update, notification);
+  }
+
+  /** The v2 notifications of a v1 notification, in the order they go out. */
+  private v2Notifications({
+    update,
+    ...notification
+  }: AcpSessionNotification): v2.UpdateSessionNotification[] {
     // A subagent that a replay announces replays too, so its messages are
     // cleared before their first replayed chunk, as the parent's are.
     if (
@@ -236,14 +290,12 @@ class V2ClientConnection implements AcpClient {
     // A subagent's work state also goes to the child's own stream, after the
     // parent's copy.
     const childState = v2ChildStateUpdate(update);
-    // Every update goes to the connection before any is awaited, so an update
-    // that another call sends meanwhile cannot come between them.
-    await Promise.all([
-      ...updates.map((v2Update) =>
-        this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
-      ),
-      ...(childState ? [this.ctx.notify(v2.methods.client.session.update, childState)] : []),
-    ]);
+    // The callers hand every update to the connection before they await any,
+    // so an update that another call sends meanwhile cannot come between them.
+    return [
+      ...updates.map((v2Update) => ({ ...notification, update: v2Update })),
+      ...(childState ? [childState] : []),
+    ];
   }
 
   /**

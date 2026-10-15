@@ -3380,27 +3380,27 @@ describe("usage-limit failure replay", () => {
     expect([...agent.sessions.s1.sessionFailureState.active.keys()]).toEqual(["turn-two:error"]);
   });
 
-  it("does not record a restored failure when publishing it fails", async () => {
-    const errors: unknown[][] = [];
+  it("fails the replay when the client cannot take the restored failure", async () => {
     const agent = new ClaudeAcpAgent(
       {
         sessionUpdate: async () => {
           throw new Error("client disconnected");
         },
       } as unknown as AcpClient,
-      { log: () => {}, error: (...args) => errors.push(args) },
+      { log: () => {}, error: () => {} },
     );
     await initializeClient(agent, airCapabilities);
     agent.sessions.s1 = mockSessionState();
     vi.mocked(getSessionMessages).mockResolvedValueOnce([usageLimitMessage]);
 
-    await (
-      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
-    ).replaySessionHistory("s1");
-
-    expect(agent.sessions.s1.sessionFailureState.active.size).toBe(0);
-    expect(agent.sessions.s1.sessionFailureState.revisions.size).toBe(0);
-    expect(errors.flat().join(" ")).toContain("failed to publish AIR session failure");
+    // The replay holds its latest update until it knows whether that update is
+    // the last one (see `load-replay-marks.ts`). So the send error comes when
+    // the replay ends, and not to the failure controller.
+    await expect(
+      (
+        agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+      ).replaySessionHistory("s1"),
+    ).rejects.toThrow("client disconnected");
   });
 
   it("recognizes a sanitized raw transcript through the real SDK parser", async () => {

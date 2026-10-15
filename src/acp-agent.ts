@@ -312,6 +312,7 @@ import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./u
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
+import { type LoadReplay, LoadReplayMarker, unmarkedLoadReplay } from "./load-replay-marks.js";
 import {
   MODE_CONFIG_ID,
   resolveInitialPermissionMode,
@@ -2326,6 +2327,12 @@ export interface AcpClient {
   completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
   extNotification(method: string, params: Record<string, unknown>): Promise<void>;
+  /**
+   * The sender of the history replay of `sessionId` on `session/load`. It
+   * marks the replayed updates (see `load-replay-marks.ts`). Without it, the
+   * replay sends its updates with {@link sessionUpdate}, unmarked.
+   */
+  loadReplay?(sessionId: string): LoadReplay<AcpSessionNotification>;
 }
 
 /**
@@ -2386,15 +2393,64 @@ class ClientConnection implements AcpClient {
 class ChangedMetaClient implements AcpClient {
   private readonly filter = new ChangedMetaFilter();
 
+  /** The marker of each session whose history replays, when the inner client
+   *  has no {@link AcpClient.loadReplay} of its own. */
+  private readonly replays = new Map<string, LoadReplayMarker<AcpSessionNotification>>();
+
   constructor(
     private readonly inner: AcpClient,
     private readonly airClient: () => boolean,
   ) {}
 
   async sessionUpdate(params: AcpSessionNotification): Promise<void> {
-    if (!this.airClient()) return this.inner.sessionUpdate(params);
+    const filtered = this.filtered(params);
+    if (!filtered) return;
+    // A live update of a session whose replay holds an update waits behind it.
+    const replay = this.replays.get(filtered.sessionId);
+    await (replay ? replay.other(filtered) : this.inner.sessionUpdate(filtered));
+  }
+
+  /**
+   * Only an AIR client gets the replay marks. They are set after the
+   * {@link ChangedMetaFilter}, because the filter can drop an update, and a
+   * dropped update must not take an index or the end mark.
+   */
+  loadReplay(sessionId: string): LoadReplay<AcpSessionNotification> {
+    if (!this.airClient() || this.replays.has(sessionId)) {
+      return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
+    }
+    // The v2 connection marks the v2 updates itself, because one v1 update can
+    // become several v2 updates.
+    const inner = this.inner.loadReplay?.(sessionId) ?? this.marker(sessionId);
+    return {
+      sessionUpdate: async (notification) => {
+        const filtered = this.filtered(notification);
+        if (filtered) await inner.sessionUpdate(filtered);
+      },
+      finish: (complete) => inner.finish(complete),
+    };
+  }
+
+  private marker(sessionId: string): LoadReplay<AcpSessionNotification> {
+    const marker = new LoadReplayMarker<AcpSessionNotification>(sessionId, (notification) =>
+      this.inner.sessionUpdate(notification),
+    );
+    this.replays.set(sessionId, marker);
+    return {
+      sessionUpdate: (notification) => marker.replayed(notification),
+      finish: (complete) => {
+        this.replays.delete(sessionId);
+        return marker.finish(complete);
+      },
+    };
+  }
+
+  /** `params` as the client gets it, or `undefined` when the
+   *  {@link ChangedMetaFilter} drops it. */
+  private filtered(params: AcpSessionNotification): AcpSessionNotification | undefined {
+    if (!this.airClient()) return params;
     const update = this.filter.apply(params.update as SessionNotification["update"]);
-    if (update) await this.inner.sessionUpdate({ ...params, update } as AcpSessionNotification);
+    return update ? ({ ...params, update } as AcpSessionNotification) : undefined;
   }
 
   requestPermission(
@@ -8809,8 +8865,32 @@ export class ClaudeAcpAgent {
     return { configOptions: session.configOptions };
   }
 
+  /**
+   * Replays the history of `sessionId` to the client. For an AIR client, the
+   * replayed updates of the session carry the replay marks, and the last one
+   * carries the end mark when the replay finished whole (see
+   * `load-replay-marks.ts`). A replay that stopped or failed gets no end mark.
+   */
   private async replaySessionHistory(
     sessionId: string,
+    resumedMessages?: SessionMessage[],
+    pending?: PendingReplay,
+  ): Promise<void> {
+    const replay =
+      this.client.loadReplay?.(sessionId) ??
+      unmarkedLoadReplay((notification) => this.client.sessionUpdate(notification));
+    let complete = false;
+    try {
+      await this.sendSessionHistory(sessionId, replay, resumedMessages, pending);
+      complete = !pending?.stopped;
+    } finally {
+      await replay.finish(complete);
+    }
+  }
+
+  private async sendSessionHistory(
+    sessionId: string,
+    replay: LoadReplay<AcpSessionNotification>,
     resumedMessages?: SessionMessage[],
     pending?: PendingReplay,
   ): Promise<void> {
@@ -8846,7 +8926,7 @@ export class ClaudeAcpAgent {
               if (!live) return pending !== undefined && !pending.stopped;
               return live.sessionFailureState === session.sessionFailureState;
             },
-            sendUpdate: (notification) => this.client.sessionUpdate(notification),
+            sendUpdate: (notification) => replay.sessionUpdate(notification),
             logger: this.logger,
           })
         : undefined;
@@ -8968,7 +9048,7 @@ export class ClaudeAcpAgent {
         const parentSessionId = child.parentToolUseId
           ? (replayChildren.get(child.parentToolUseId)?.sessionId ?? sessionId)
           : sessionId;
-        await this.client.sessionUpdate(
+        await replay.sessionUpdate(
           asSdkSessionNotification({
             sessionId: parentSessionId,
             update: {
@@ -9003,7 +9083,7 @@ export class ClaudeAcpAgent {
     const rfdReplay =
       form === "rfd"
         ? new RfdSubagentReplay(rfdHistory, (notification) =>
-            this.client.sessionUpdate(asSdkSessionNotification(notification)),
+            replay.sessionUpdate(asSdkSessionNotification(notification)),
           )
         : undefined;
     rfdReplay?.scan(messages, sessionId);
@@ -9018,7 +9098,7 @@ export class ClaudeAcpAgent {
     const replayAsyncTasks = new AsyncTaskRuntime(
       clientSupportsAsyncTasks(this.clientCapabilities),
       sessionId,
-      async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
+      async (notification) => replay.sessionUpdate(asSdkSessionNotification(notification)),
       {
         routeOf: (toolCallId) => {
           const target = replayToolUses.get(toolCallId)?.sessionId;
@@ -9183,7 +9263,7 @@ export class ClaudeAcpAgent {
         message.uuid.length > 0
       ) {
         const replayCompaction = new ContextCompactionLifecycle(
-          (notification) => this.client.sessionUpdate(notification),
+          (notification) => replay.sessionUpdate(notification),
           {
             sessionId,
             presentation: "compaction_update",
@@ -9227,7 +9307,7 @@ export class ClaudeAcpAgent {
         ) {
           continue;
         }
-        await this.client.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
+        await replay.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
       }
 
       // The history of each subagent is in its own transcript. The replay
@@ -9283,7 +9363,7 @@ export class ClaudeAcpAgent {
         const parentSessionId = child.parentToolUseId
           ? (replayChildren.get(child.parentToolUseId)?.sessionId ?? sessionId)
           : sessionId;
-        await this.client.sessionUpdate(
+        await replay.sessionUpdate(
           asSdkSessionNotification({
             sessionId: parentSessionId,
             update: {

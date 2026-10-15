@@ -1083,6 +1083,53 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("marks each replayed v2 update of an AIR client, a message clear included", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, {
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      } as v2.ClientCapabilities);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("user", randomUUID(), { role: "user", content: "Say hello" }),
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_hello",
+          role: "assistant",
+          content: [{ type: "text", text: "Hello!" }],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      client.sessionUpdates.length = 0;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await client.authUpdate(1);
+    });
+
+    const replayed = client.sessionUpdates.filter(
+      (notification) => notification._meta?.loadSessionReplayIndex !== undefined,
+    );
+    expect(replayed.map((notification) => notification._meta?.loadSessionReplayIndex)).toEqual(
+      replayed.map((_, index) => index),
+    );
+    expect(
+      replayed.map((notification) => notification._meta?.loadSessionEndOfRecordedHistory),
+    ).toEqual([...replayed.slice(1).map(() => undefined), true]);
+    // The clear of the replayed answer and its first chunk each take an index.
+    expect(replayed.map((notification) => notification.update)).toEqual(
+      expect.arrayContaining([
+        { sessionUpdate: "agent_message", messageId: "msg_hello", content: [] },
+        expect.objectContaining({ sessionUpdate: "agent_message_chunk", messageId: "msg_hello" }),
+      ]),
+    );
+    // Nothing after the replay is marked.
+    const last = client.sessionUpdates.indexOf(replayed.at(-1)!);
+    for (const notification of client.sessionUpdates.slice(last + 1)) {
+      expect(notification._meta?.loadSessionReplayIndex).toBeUndefined();
+    }
+  });
+
   it("replays the plan of an approved ExitPlanMode as a markdown plan", async () => {
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {

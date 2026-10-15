@@ -51,6 +51,7 @@ import {
 } from "./acp-scenarios/compare.js";
 import { EXTENSION_SESSION_UPDATES, validateRecorded } from "./acp-scenarios/schema.js";
 import { LEGACY_AIR_CUSTOM_ANSWER_KEY } from "../air-extension.js";
+import { LOAD_REPLAY_END_KEY, LOAD_REPLAY_INDEX_KEY } from "../load-replay-marks.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -692,11 +693,14 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
         for (const { at, meta } of metaObjects(air(scenario.name))) {
           const duplicates = [
             // Released AIR versions read only the legacy custom answer key, so AIR gets both.
+            // AIR reads the replay marks under these top-level names only.
             ...Object.keys(meta).filter(
               (k) =>
                 AIR_ONLY_META_KEYS.has(k) &&
                 k !== "jetbrains" &&
-                k !== LEGACY_AIR_CUSTOM_ANSWER_KEY,
+                k !== LEGACY_AIR_CUSTOM_ANSWER_KEY &&
+                k !== LOAD_REPLAY_INDEX_KEY &&
+                k !== LOAD_REPLAY_END_KEY,
             ),
             ...Object.keys((meta.claudeCode as Record<string, unknown> | undefined) ?? {}).filter(
               (k) => AIR_ONLY_CLAUDE_CODE_KEYS.has(k),

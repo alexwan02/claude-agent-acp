@@ -38,6 +38,8 @@ export const AIR_ONLY_META_KEYS = new Set([
   "kind",
   "permission",
   "_askUserQuestionCustomAnswer",
+  "loadSessionReplayIndex",
+  "loadSessionEndOfRecordedHistory",
 ]);
 
 /** The `_meta.claudeCode` keys that exist only for AIR. */

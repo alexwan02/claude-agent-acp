@@ -29,6 +29,7 @@ It describes only this adapter.
 - [Session index](#session-index)
 - [Context compaction](#context-compaction)
 - [Question custom answers](#question-custom-answers)
+- [Load replay marks](#load-replay-marks)
 - [Session fork point](#session-fork-point)
 - [Presentation hints](#presentation-hints)
 - [Removed keys](#removed-keys)
@@ -1575,6 +1576,32 @@ A client can render the companion as the free-text choice of that question.
 For AIR, the companion field also carries the same value under the root key `_meta._askUserQuestionCustomAnswer`.
 Released AIR versions read only that key.
 A client that is not AIR gets neither key.
+
+## Load replay marks
+
+ACP has no signal that the history replay of `session/load` is over, other than the response.
+The adapter replays the transcript while the Claude Code CLI starts, so the history arrives long before the response.
+AIR shows the history when it sees the end mark, and does not wait for the response.
+
+The adapter puts the marks into the notification `_meta` (`params._meta`, beside `sessionId` and `update`).
+It keeps the other keys of that `_meta`.
+
+| Key                               | Shape   | On                                                |
+| --------------------------------- | ------- | ------------------------------------------------- |
+| `loadSessionReplayIndex`          | integer | every replayed notification of the loaded session |
+| `loadSessionEndOfRecordedHistory` | `true`  | the last replayed notification, whatever its kind |
+
+- The index starts at 0 and goes up by 1, in the order of the notifications.
+- The adapter does not send `loadSessionReplaySize`. That key is the last index, not the count, and the adapter does not know it before the replay ends.
+- A replay with no notification has no marks.
+- A replay that stops part way has no end mark. This happens when the CLI start fails during the replay. AIR then knows that the replay is truncated.
+- A live notification has no marks. This covers `available_commands_update` after the response, and any update that the CLI start sends during the replay.
+- The replay holds its latest notification until the next one arrives, or until it ends. A notification of another session that comes meanwhile waits behind it, so the order does not change.
+- A subagent's replayed history goes to its own session id and has no marks. Only the loaded session is marked.
+- On ACP v2, `session/resume` with `replayFrom: {type: "start"}` replays in the same way. The marks go on the v2 updates, so a message clear and its first chunk each take an index.
+
+The names come from the JetBrains cloud agent, which AIR already reads.
+The adapter sends them only to an AIR client; see the [compatibility rule](#compatibility-rule).
 
 ## Session fork point
 
