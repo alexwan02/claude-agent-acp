@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.92.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.91.0...v0.92.0) (2026-10-15)
+
+
+### Features
+
+* add the MCP server and tool to AIR tool calls ([#1359](https://github.com/agentclientprotocol/claude-agent-acp/issues/1359)) ([872e93f](https://github.com/agentclientprotocol/claude-agent-acp/commit/872e93f11fde8abc528822d29cebcc542b05e9e8))
+* publish the predicted follow-up prompt as _meta.promptSuggestions ([#1356](https://github.com/agentclientprotocol/claude-agent-acp/issues/1356)) ([78a29f5](https://github.com/agentclientprotocol/claude-agent-acp/commit/78a29f58ba1eb1b54896d8d73f49402ee50aa087))
+
+
+### Bug Fixes
+
+* include subagent file edits in the file-change report ([#1357](https://github.com/agentclientprotocol/claude-agent-acp/issues/1357)) ([910d83c](https://github.com/agentclientprotocol/claude-agent-acp/commit/910d83ceea78a03b39002cf2dcc275442838e2db))
+
 ## [0.91.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.90.0...v0.91.0) (2026-10-15)
 
 
