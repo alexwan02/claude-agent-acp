@@ -48,21 +48,36 @@ export function unmarkedLoadReplay<N>(send: (notification: N) => Promise<void>):
  *
  * The last notification is known only when the replay ends, so the marker
  * holds the latest replayed notification of the session and sends it when the
- * next one arrives, or with the end mark at {@link finish}. Any other
- * notification that arrives while one is held waits behind it, so nothing is
+ * next one arrives, or with the end mark at {@link finish}. Every other message
+ * that comes while one is held waits behind it in one FIFO queue, so nothing is
  * reordered. For example, a subagent's replayed history goes to its own
  * session id and gets no mark, but it still goes out after the parent's held
- * `tool_call`. A live update of the loaded session that the CLI start sends
- * during the replay also waits, and gets no mark.
+ * `tool_call`. A live `tool_call` update of the loaded session and the
+ * `session/request_permission` of that tool call also wait, in call order.
  *
- * Each method hands its notifications to `deliver` synchronously and in
- * order, before it awaits any of them.
+ * When the held notification goes out, the marker hands it and then each
+ * queued message to the connection synchronously and in order, before it
+ * awaits any of them.
+ *
+ * Each live sender ({@link other}) gets the result of its own message: its
+ * promise settles when the connection settles that message, and a request
+ * resolves with its response. A replayed notification cannot work that way.
+ * The replay awaits each update before it sends the next, and the held update
+ * goes out only with the next update or at {@link finish}. So
+ * {@link replayed} settles when the update before it is delivered, which keeps
+ * the replay in step with the client, and it does not reject. The first
+ * delivery error of a replayed notification rejects {@link finish}. So the
+ * error fails the replay, and not a later update or a live sender.
  */
 export class LoadReplayMarker<N extends ReplayNotification> {
   private nextIndex = 0;
   private held: N | undefined;
-  private queued: N[] = [];
+  /** The messages that wait behind {@link held}, in call order. */
+  private queued: (() => void)[] = [];
   private finished = false;
+  /** The deliveries of the replayed notifications that have not settled. */
+  private readonly inFlight = new Set<Promise<void>>();
+  private failure: { error: unknown } | undefined;
 
   constructor(
     private readonly sessionId: string,
@@ -71,43 +86,129 @@ export class LoadReplayMarker<N extends ReplayNotification> {
 
   /** A notification that the replay sends. Only one of the loaded session gets a mark. */
   replayed(notification: N): Promise<void> {
-    if (this.finished || notification.sessionId !== this.sessionId) return this.other(notification);
+    if (this.finished) return call(() => this.deliver(notification));
+    if (notification.sessionId !== this.sessionId) {
+      if (this.held === undefined) return call(() => this.deliver(notification));
+      this.queued.push(() => void this.track(notification));
+      return Promise.resolve();
+    }
     const marked = withMeta(notification, { [LOAD_REPLAY_INDEX_KEY]: this.nextIndex++ });
-    const ready = this.release();
+    const previous = this.release(false);
     this.held = marked;
-    return this.sendAll(ready);
+    return previous;
   }
 
-  /** A notification that is not part of the replay. It gets no mark. */
-  other(notification: N): Promise<void> {
-    if (this.held === undefined) return this.deliver(notification);
-    this.queued.push(notification);
-    return Promise.resolve();
+  /**
+   * A message that is not part of the replay, such as a live update or a
+   * permission request. It gets no mark. `send` runs at once when nothing is
+   * held. Otherwise it runs right after the held notification goes out. The
+   * promise settles with the result of `send`.
+   */
+  other<T>(send: () => Promise<T>): Promise<T> {
+    if (this.held === undefined) return call(send);
+    return new Promise<T>((resolve, reject) => {
+      this.queued.push(() => void call(send).then(resolve, reject));
+    });
   }
 
   /**
    * Sends what is still held. The held notification gets the end mark when
    * `complete` is true. A replay that stopped part way gets none, which tells
-   * the client that the replay is truncated.
+   * the client that the replay is truncated. Rejects with the first delivery
+   * error of a replayed notification.
    */
-  finish(complete: boolean): Promise<void> {
+  async finish(complete: boolean): Promise<void> {
     this.finished = true;
-    const held = this.held;
-    const ready = this.release();
-    if (complete && held !== undefined) ready[0] = withMeta(held, { [LOAD_REPLAY_END_KEY]: true });
-    return this.sendAll(ready);
+    void this.release(complete);
+    await Promise.all(this.inFlight);
+    if (this.failure) throw this.failure.error;
   }
 
-  /** The held notification and the ones queued behind it, in order. */
-  private release(): N[] {
-    const ready = this.held === undefined ? [] : [this.held, ...this.queued];
+  /**
+   * Sends the held notification, with the end mark when `end` is true, and
+   * then the queued messages. Settles when the held notification is delivered.
+   */
+  private release(end: boolean): Promise<void> {
+    const held = this.held;
+    const queued = this.queued;
     this.held = undefined;
     this.queued = [];
-    return ready;
+    if (held === undefined) return Promise.resolve();
+    const delivered = this.track(end ? withMeta(held, { [LOAD_REPLAY_END_KEY]: true }) : held);
+    for (const send of queued) send();
+    return delivered;
   }
 
-  private async sendAll(notifications: N[]): Promise<void> {
-    await Promise.all(notifications.map((notification) => this.deliver(notification)));
+  /** Delivers a replayed notification and keeps its error for {@link finish}. */
+  private track(notification: N): Promise<void> {
+    const delivered = call(() => this.deliver(notification)).catch((error: unknown) => {
+      this.failure ??= { error };
+    });
+    this.inFlight.add(delivered);
+    void delivered.then(() => this.inFlight.delete(delivered));
+    return delivered;
+  }
+}
+
+/**
+ * The replay markers of one connection, by session id. Every outbound message
+ * of a session goes through {@link send}, so it waits behind the held
+ * notification of a replay of that session. When the session does not
+ * replay, {@link send} sends at once.
+ */
+export class LoadReplays<N extends ReplayNotification> {
+  private readonly markers = new Map<string, LoadReplayMarker<N>>();
+  /** The session of each open URL elicitation. The completion notification
+   *  names only the elicitation. */
+  private readonly elicitations = new Map<string, string>();
+
+  constructor(private readonly deliver: (notification: N) => Promise<void>) {}
+
+  /** The marked replay of `sessionId`, or `undefined` when that session already replays. */
+  start(sessionId: string): LoadReplay<N> | undefined {
+    if (this.markers.has(sessionId)) return undefined;
+    const marker = new LoadReplayMarker<N>(sessionId, this.deliver);
+    this.markers.set(sessionId, marker);
+    return {
+      sessionUpdate: (notification) => marker.replayed(notification),
+      finish: (complete) => {
+        this.markers.delete(sessionId);
+        return marker.finish(complete);
+      },
+    };
+  }
+
+  /** Runs `send`, which sends one message of `sessionId`, in the queue of that session. */
+  send<T>(sessionId: unknown, send: () => Promise<T>): Promise<T> {
+    const marker = typeof sessionId === "string" ? this.markers.get(sessionId) : undefined;
+    return marker ? marker.other(send) : call(send);
+  }
+
+  /** Runs `send`, which sends an elicitation request, in the queue of the session that `params` names. */
+  createElicitation<T>(params: object, send: () => Promise<T>): Promise<T> {
+    // A request names a session, or the request that it belongs to. Only a
+    // URL request names an elicitation id.
+    const { sessionId, elicitationId } = params as { sessionId?: unknown; elicitationId?: unknown };
+    if (typeof sessionId === "string" && typeof elicitationId === "string") {
+      this.elicitations.set(elicitationId, sessionId);
+    }
+    return this.send(sessionId, send);
+  }
+
+  /** Runs `send`, which completes an elicitation, in the queue of the session of its request. */
+  completeElicitation<T>(elicitationId: string, send: () => Promise<T>): Promise<T> {
+    const sessionId = this.elicitations.get(elicitationId);
+    this.elicitations.delete(elicitationId);
+    return this.send(sessionId, send);
+  }
+}
+
+/** The promise of `send`, or a rejected promise when `send` throws. */
+function call<T>(send: () => Promise<T>): Promise<T> {
+  try {
+    return send();
+  } catch (error) {
+    return Promise.reject(error);
   }
 }
 

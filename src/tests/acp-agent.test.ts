@@ -3381,26 +3381,30 @@ describe("usage-limit failure replay", () => {
   });
 
   it("fails the replay when the client cannot take the restored failure", async () => {
+    const errors: unknown[][] = [];
     const agent = new ClaudeAcpAgent(
       {
         sessionUpdate: async () => {
           throw new Error("client disconnected");
         },
       } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
+      { log: () => {}, error: (...args) => errors.push(args) },
     );
     await initializeClient(agent, airCapabilities);
     agent.sessions.s1 = mockSessionState();
     vi.mocked(getSessionMessages).mockResolvedValueOnce([usageLimitMessage]);
 
     // The replay holds its latest update until it knows whether that update is
-    // the last one (see `load-replay-marks.ts`). So the send error comes when
-    // the replay ends, and not to the failure controller.
+    // the last one (see `load-replay-marks.ts`). The replay awaits each update
+    // before the next, so the failure controller cannot wait for the delivery
+    // of its own update. The send error fails the replay when it ends, and no
+    // other caller gets it.
     await expect(
       (
         agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
       ).replaySessionHistory("s1"),
     ).rejects.toThrow("client disconnected");
+    expect(errors.flat().join(" ")).not.toContain("failed to publish AIR session failure");
   });
 
   it("recognizes a sanitized raw transcript through the real SDK parser", async () => {
@@ -3425,6 +3429,122 @@ describe("usage-limit failure replay", () => {
       .find(Boolean);
     expect(failure).toEqual(expect.objectContaining({ category: "limit", severity: "error" }));
     expect(failure.title).toContain("individual spend limit");
+  });
+});
+
+describe("load replay queue", () => {
+  const AIR_CLIENT = { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } };
+
+  /** The client that an agent of an AIR client talks to, over `inner`. */
+  async function airClient(inner: Partial<AcpClient>): Promise<AcpClient> {
+    const agent = new ClaudeAcpAgent(inner as AcpClient, { log: () => {}, error: () => {} });
+    await initializeClient(agent, AIR_CLIENT);
+    return (agent as unknown as { client: AcpClient }).client;
+  }
+
+  const chunk = (text: string) =>
+    ({
+      sessionId: "s",
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    }) as AcpSessionNotification;
+  const toolCall = {
+    sessionId: "s",
+    update: { sessionUpdate: "tool_call", toolCallId: "t1", title: "Bash", status: "pending" },
+  } as AcpSessionNotification;
+  const permissionRequest = {
+    sessionId: "s",
+    toolCall: { toolCallId: "t1" },
+    options: [],
+  } as unknown as Parameters<AcpClient["requestPermission"]>[0];
+
+  const label = (notification: AcpSessionNotification) =>
+    `${notification.update.sessionUpdate} ${(notification._meta as Record<string, unknown> | undefined)?.loadSessionReplayIndex ?? "live"}`;
+
+  it("sends a permission request after the held replay update and the queued tool call", async () => {
+    const sent: string[] = [];
+    const client = await airClient({
+      sessionUpdate: async (notification) => {
+        sent.push(label(notification));
+      },
+      requestPermission: async () => {
+        sent.push("request_permission");
+        return { outcome: { outcome: "cancelled" } };
+      },
+    });
+    const replay = client.loadReplay!("s");
+    await replay.sessionUpdate(chunk("history"));
+
+    let liveSettled = false;
+    const live = client.sessionUpdate(toolCall).then(() => (liveSettled = true));
+    const permission = client.requestPermission(permissionRequest);
+    await new Promise((resolve) => setImmediate(resolve));
+    // Both wait behind the held replay update, and the live sender waits too.
+    expect(sent).toEqual([]);
+    expect(liveSettled).toBe(false);
+
+    await replay.finish(true);
+    await expect(permission).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    await live;
+    expect(sent).toEqual(["agent_message_chunk 0", "tool_call live", "request_permission"]);
+  });
+
+  it("gives a live sender its own delivery error, and does not fail the replay with it", async () => {
+    const client = await airClient({
+      sessionUpdate: async (notification) => {
+        if (notification.update.sessionUpdate === "tool_call") throw new Error("tool call lost");
+      },
+    });
+    const replay = client.loadReplay!("s");
+    await replay.sessionUpdate(chunk("a"));
+    const live = client.sessionUpdate(toolCall);
+    const liveResult = live.then(
+      () => "sent",
+      (error: Error) => error.message,
+    );
+
+    await expect(replay.sessionUpdate(chunk("b"))).resolves.toBeUndefined();
+    await expect(replay.finish(true)).resolves.toBeUndefined();
+    expect(await liveResult).toBe("tool call lost");
+  });
+
+  it("fails the replay, and not the next update or a live sender, when a replayed update is lost", async () => {
+    const client = await airClient({
+      sessionUpdate: async (notification) => {
+        const { content } = notification.update as { content?: { text?: string } };
+        if (content?.text === "a") throw new Error("history lost");
+      },
+    });
+    const replay = client.loadReplay!("s");
+    await replay.sessionUpdate(chunk("a"));
+    const live = client.sessionUpdate(toolCall);
+
+    await expect(replay.sessionUpdate(chunk("b"))).resolves.toBeUndefined();
+    await expect(live).resolves.toBeUndefined();
+    await expect(replay.finish(true)).rejects.toThrow("history lost");
+  });
+
+  it("sends a message of another session at once", async () => {
+    const sent: string[] = [];
+    const client = await airClient({
+      sessionUpdate: async (notification) => {
+        sent.push(`${notification.sessionId} ${label(notification)}`);
+      },
+      requestPermission: async (params) => {
+        sent.push(`${params.sessionId} request_permission`);
+        return { outcome: { outcome: "cancelled" } };
+      },
+    });
+    const replay = client.loadReplay!("s");
+    await replay.sessionUpdate(chunk("history"));
+    await client.sessionUpdate({ ...toolCall, sessionId: "other" });
+    await client.requestPermission({ ...permissionRequest, sessionId: "other" });
+    await replay.finish(true);
+
+    expect(sent).toEqual([
+      "other tool_call live",
+      "other request_permission",
+      "s agent_message_chunk 0",
+    ]);
   });
 });
 

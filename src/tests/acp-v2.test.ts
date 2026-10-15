@@ -17,7 +17,7 @@ import {
   type Options,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent } from "../acp-agent.js";
+import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { clientSupportsCompactionUpdates } from "../context-compaction.js";
 import { v2DiffContent } from "../diff.js";
@@ -1128,6 +1128,70 @@ describe("ACP v2 prompts", () => {
     for (const notification of client.sessionUpdates.slice(last + 1)) {
       expect(notification._meta?.loadSessionReplayIndex).toBeUndefined();
     }
+  });
+
+  it("keeps the call order of a state update and a permission request during a marked replay", async () => {
+    // The number of session updates that the client has when the permission request comes.
+    let updatesAtPermission: number | undefined;
+    const client = v2Client({
+      answerPermission: () => {
+        updatesAtPermission = client.sessionUpdates.length;
+        return { outcome: { outcome: "cancelled" } };
+      },
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, {
+        _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+      } as v2.ClientCapabilities);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      // The v2 connection of the agent, under its v1 client wrapper.
+      const connection = (
+        agents.at(-1) as unknown as {
+          client: { inner: AcpClient & { send(n: v2.UpdateSessionNotification): Promise<void> } };
+        }
+      ).client.inner;
+      const chunk = (text: string) =>
+        ({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            messageId: "msg_replayed",
+            content: { type: "text", text },
+          },
+        }) as Parameters<AcpClient["sessionUpdate"]>[0];
+      client.sessionUpdates.length = 0;
+
+      const replay = connection.loadReplay!(sessionId);
+      await replay.sessionUpdate(chunk("first"));
+      const state = connection.send({
+        sessionId,
+        update: { sessionUpdate: "state_update", state: "running" },
+      });
+      const permission = connection.requestPermission({
+        sessionId,
+        title: "Run Bash",
+        toolCall: { toolCallId: "t1", title: "Bash" },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      } as unknown as Parameters<AcpClient["requestPermission"]>[0]);
+      await replay.sessionUpdate(chunk("second"));
+      await replay.finish(true);
+      await Promise.all([state, permission]);
+      await client.authUpdate(1);
+    });
+
+    expect(
+      client.sessionUpdates.map(({ update, _meta }) => [
+        update.sessionUpdate,
+        _meta?.loadSessionReplayIndex,
+        _meta?.loadSessionEndOfRecordedHistory,
+      ]),
+    ).toEqual([
+      ["agent_message_chunk", 0, undefined],
+      ["state_update", undefined, undefined],
+      ["agent_message_chunk", 1, true],
+    ]);
+    // The permission request comes after the held chunk and the state update.
+    expect(updatesAtPermission).toBe(2);
   });
 
   it("replays the plan of an approved ExitPlanMode as a markdown plan", async () => {

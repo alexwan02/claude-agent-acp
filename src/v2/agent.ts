@@ -16,7 +16,7 @@ import type {
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
-import { type LoadReplay, LoadReplayMarker, unmarkedLoadReplay } from "../load-replay-marks.js";
+import { type LoadReplay, LoadReplays, unmarkedLoadReplay } from "../load-replay-marks.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
@@ -158,11 +158,15 @@ class V2ClientConnection implements AcpClient {
    */
   private readonly replays = new Map<string, Set<string>>();
 
-  /** The replay marker of each session whose marked history replays (see {@link loadReplay}). */
-  private readonly replayMarkers = new Map<
-    string,
-    LoadReplayMarker<v2.UpdateSessionNotification>
-  >();
+  /**
+   * The replay markers of the sessions whose marked history replays (see
+   * {@link loadReplay}). While the replay of a session holds an update, every
+   * message of that session waits behind it: a live or state update, a
+   * permission or elicitation request, and an extension notification.
+   */
+  private readonly replayMarkers = new LoadReplays<v2.UpdateSessionNotification>((notification) =>
+    this.notify(notification),
+  );
 
   /** The session whose replay announced each replaying subagent. */
   private readonly replayRoots = new Map<string, string>();
@@ -203,32 +207,33 @@ class V2ClientConnection implements AcpClient {
   /**
    * Sends a v2 session update, and logs rather than rejects when that fails.
    * It and {@link sessionUpdate} hand updates to the connection synchronously,
-   * so they go out in the order of the calls. The agent's consumer awaits each
+   * or to the queue of a replay of the session, so they go out in the order of
+   * the calls. The agent's consumer awaits each
    * of its updates before it reports the next turn event, so a turn's state
    * follows the output that came before it. (An update the consumer is still
    * routing can be overtaken by an event from elsewhere, such as a permission
    * request opening.)
    */
   send(notification: v2.UpdateSessionNotification): Promise<void> {
-    return this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
-      this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
-    });
+    return this.replayMarkers
+      .send(notification.sessionId, () => this.notify(notification))
+      .catch((error) => {
+        this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
+      });
   }
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
     if (!isExtensionMethod(method)) {
       return Promise.reject(new Error(`${method} is not an ACP extension method`));
     }
-    return this.ctx.notify(method, params);
+    return this.replayMarkers.send(params.sessionId, () => this.ctx.notify(method, params));
   }
 
   async sessionUpdate(notification: AcpSessionNotification): Promise<void> {
-    // A live update of a session whose replay holds an update waits behind it.
     await Promise.all(
-      this.v2Notifications(notification).map((v2Notification) => {
-        const marker = this.replayMarkers.get(v2Notification.sessionId);
-        return marker ? marker.other(v2Notification) : this.notify(v2Notification);
-      }),
+      this.v2Notifications(notification).map((v2Notification) =>
+        this.replayMarkers.send(v2Notification.sessionId, () => this.notify(v2Notification)),
+      ),
     );
   }
 
@@ -239,25 +244,17 @@ class V2ClientConnection implements AcpClient {
    * such as a message clear and its first chunk.
    */
   loadReplay(sessionId: string): LoadReplay<AcpSessionNotification> {
-    if (this.replayMarkers.has(sessionId)) {
-      return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
-    }
-    const marker = new LoadReplayMarker<v2.UpdateSessionNotification>(sessionId, (notification) =>
-      this.notify(notification),
-    );
-    this.replayMarkers.set(sessionId, marker);
+    const replay = this.replayMarkers.start(sessionId);
+    if (!replay) return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
     return {
       sessionUpdate: async (notification) => {
         await Promise.all(
           this.v2Notifications(notification).map((v2Notification) =>
-            marker.replayed(v2Notification),
+            replay.sessionUpdate(v2Notification),
           ),
         );
       },
-      finish: (complete) => {
-        this.replayMarkers.delete(sessionId);
-        return marker.finish(complete);
-      },
+      finish: (complete) => replay.finish(complete),
     };
   }
 
@@ -340,10 +337,11 @@ class V2ClientConnection implements AcpClient {
   ): Promise<RequestPermissionResponse> {
     // The subject is an update of the tool call, with its stored `_meta`.
     const toolCall = this.toolCallMeta.subject(params.sessionId, params.toolCall);
-    const response = await this.ctx.request(
-      v2.methods.client.session.requestPermission,
-      v2PermissionRequest({ ...params, toolCall }),
-      { cancellationSignal: signal },
+    const request = v2PermissionRequest({ ...params, toolCall });
+    const response = await this.replayMarkers.send(params.sessionId, () =>
+      this.ctx.request(v2.methods.client.session.requestPermission, request, {
+        cancellationSignal: signal,
+      }),
     );
     return v1PermissionResponse(response);
   }
@@ -353,18 +351,22 @@ class V2ClientConnection implements AcpClient {
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse> {
-    return this.ctx.request(
-      v2.methods.client.elicitation.create,
-      // The v1 types accept a property schema with any tag; the v2 types accept
-      // one only in a received value. As on v1, an MCP server's schema is
-      // relayed here unchanged, so this cast does not check it.
-      params as v2.CreateElicitationRequest,
-      { cancellationSignal: signal },
+    return this.replayMarkers.createElicitation(params, () =>
+      this.ctx.request(
+        v2.methods.client.elicitation.create,
+        // The v1 types accept a property schema with any tag; the v2 types accept
+        // one only in a received value. As on v1, an MCP server's schema is
+        // relayed here unchanged, so this cast does not check it.
+        params as v2.CreateElicitationRequest,
+        { cancellationSignal: signal },
+      ),
     );
   }
 
   completeElicitation(params: CompleteElicitationNotification): Promise<void> {
-    return this.ctx.notify(v2.methods.client.elicitation.complete, params);
+    return this.replayMarkers.completeElicitation(params.elicitationId, () =>
+      this.ctx.notify(v2.methods.client.elicitation.complete, params),
+    );
   }
 
   // v2 has no client file system. The agent never calls these on v2, because

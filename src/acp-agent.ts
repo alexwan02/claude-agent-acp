@@ -312,7 +312,7 @@ import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./u
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
-import { type LoadReplay, LoadReplayMarker, unmarkedLoadReplay } from "./load-replay-marks.js";
+import { type LoadReplay, LoadReplays, unmarkedLoadReplay } from "./load-replay-marks.js";
 import {
   MODE_CONFIG_ID,
   resolveInitialPermissionMode,
@@ -2393,9 +2393,16 @@ class ClientConnection implements AcpClient {
 class ChangedMetaClient implements AcpClient {
   private readonly filter = new ChangedMetaFilter();
 
-  /** The marker of each session whose history replays, when the inner client
-   *  has no {@link AcpClient.loadReplay} of its own. */
-  private readonly replays = new Map<string, LoadReplayMarker<AcpSessionNotification>>();
+  /**
+   * The replay markers of the sessions whose history replays, when the inner
+   * client has no {@link AcpClient.loadReplay} of its own. While the replay of
+   * a session holds an update, every message of that session waits behind it:
+   * a live update, a permission or elicitation request, a file request and an
+   * extension notification.
+   */
+  private readonly replays = new LoadReplays<AcpSessionNotification>((notification) =>
+    this.inner.sessionUpdate(notification),
+  );
 
   constructor(
     private readonly inner: AcpClient,
@@ -2405,9 +2412,7 @@ class ChangedMetaClient implements AcpClient {
   async sessionUpdate(params: AcpSessionNotification): Promise<void> {
     const filtered = this.filtered(params);
     if (!filtered) return;
-    // A live update of a session whose replay holds an update waits behind it.
-    const replay = this.replays.get(filtered.sessionId);
-    await (replay ? replay.other(filtered) : this.inner.sessionUpdate(filtered));
+    await this.replays.send(filtered.sessionId, () => this.inner.sessionUpdate(filtered));
   }
 
   /**
@@ -2416,32 +2421,19 @@ class ChangedMetaClient implements AcpClient {
    * dropped update must not take an index or the end mark.
    */
   loadReplay(sessionId: string): LoadReplay<AcpSessionNotification> {
-    if (!this.airClient() || this.replays.has(sessionId)) {
-      return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
-    }
     // The v2 connection marks the v2 updates itself, because one v1 update can
-    // become several v2 updates.
-    const inner = this.inner.loadReplay?.(sessionId) ?? this.marker(sessionId);
+    // become several v2 updates. A second replay of a session that already
+    // replays gets no marks.
+    const inner = this.airClient()
+      ? (this.inner.loadReplay?.(sessionId) ?? this.replays.start(sessionId))
+      : undefined;
+    if (!inner) return unmarkedLoadReplay((notification) => this.sessionUpdate(notification));
     return {
       sessionUpdate: async (notification) => {
         const filtered = this.filtered(notification);
         if (filtered) await inner.sessionUpdate(filtered);
       },
       finish: (complete) => inner.finish(complete),
-    };
-  }
-
-  private marker(sessionId: string): LoadReplay<AcpSessionNotification> {
-    const marker = new LoadReplayMarker<AcpSessionNotification>(sessionId, (notification) =>
-      this.inner.sessionUpdate(notification),
-    );
-    this.replays.set(sessionId, marker);
-    return {
-      sessionUpdate: (notification) => marker.replayed(notification),
-      finish: (complete) => {
-        this.replays.delete(sessionId);
-        return marker.finish(complete);
-      },
     };
   }
 
@@ -2457,30 +2449,34 @@ class ChangedMetaClient implements AcpClient {
     params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
-    return this.inner.requestPermission(params, signal);
+    return this.replays.send(params.sessionId, () => this.inner.requestPermission(params, signal));
   }
 
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-    return this.inner.readTextFile(params);
+    return this.replays.send(params.sessionId, () => this.inner.readTextFile(params));
   }
 
   writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-    return this.inner.writeTextFile(params);
+    return this.replays.send(params.sessionId, () => this.inner.writeTextFile(params));
   }
 
   createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse> {
-    return this.inner.createElicitation(params, signal);
+    return this.replays.createElicitation(params, () =>
+      this.inner.createElicitation(params, signal),
+    );
   }
 
   completeElicitation(params: CompleteElicitationNotification): Promise<void> {
-    return this.inner.completeElicitation(params);
+    return this.replays.completeElicitation(params.elicitationId, () =>
+      this.inner.completeElicitation(params),
+    );
   }
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
-    return this.inner.extNotification(method, params);
+    return this.replays.send(params.sessionId, () => this.inner.extNotification(method, params));
   }
 }
 

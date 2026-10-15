@@ -1595,8 +1595,9 @@ It keeps the other keys of that `_meta`.
 - The adapter does not send `loadSessionReplaySize`. That key is the last index, not the count, and the adapter does not know it before the replay ends.
 - A replay with no notification has no marks.
 - A replay that stops part way has no end mark. This happens when the CLI start fails during the replay. AIR then knows that the replay is truncated.
+- The end mark can come before a `session/load` that fails later, because the CLI start fails after the replay. The replay was whole, and the client decides what to do with the failed load.
 - A live notification has no marks. This covers `available_commands_update` after the response, and any update that the CLI start sends during the replay.
-- The replay holds its latest notification until the next one arrives, or until it ends. A notification of another session that comes meanwhile waits behind it, so the order does not change.
+- The replay holds its latest notification until the next one arrives, or until it ends. Every other message that comes meanwhile waits behind it, so the order does not change. This covers a notification of another session, and a live update, a permission request, an elicitation, or an extension notification of the loaded session.
 - A subagent's replayed history goes to its own session id and has no marks. Only the loaded session is marked.
 - On ACP v2, `session/resume` with `replayFrom: {type: "start"}` replays in the same way. The marks go on the v2 updates, so a message clear and its first chunk each take an index.
 
